@@ -3,6 +3,8 @@
 
 Set-StrictMode -Version Latest
 
+$script:RoleCrawlRoleDefinitionCache = @{}
+
 function ConvertFrom-RoleCrawlJwtPayload {
     [CmdletBinding()]
     param(
@@ -50,7 +52,7 @@ function Get-RoleCrawlSafeFileName {
     return $result
 }
 
-function Ensure-RoleCrawlConnection {
+function Initialize-RoleCrawlConnection {
     [CmdletBinding()]
     param(
         [string]$TenantId
@@ -146,12 +148,14 @@ function Resolve-RoleCrawlPrincipal {
     try {
         $principal = & $lookupCommand @lookupParams -ErrorAction Stop
     } catch {
-        Write-Warning "Unable to resolve $Type '$($ObjectId ?? $PrincipalName)': $($_.Exception.Message)"
+        $lookupIdentifier = if ($ObjectId) { $ObjectId } else { $PrincipalName }
+        Write-Warning "Unable to resolve $Type '$lookupIdentifier': $($_.Exception.Message)"
         return $null
     }
 
     if ($principal -is [System.Array] -and $principal.Count -gt 1) {
-        Write-Warning "$Type lookup for '$($PrincipalName ?? $ObjectId)' returned multiple matches. Using the first entry ($($principal[0].Id))."
+        $lookupIdentifier = if ($PrincipalName) { $PrincipalName } else { $ObjectId }
+        Write-Warning "$Type lookup for '$lookupIdentifier' returned multiple matches. Using the first entry ($($principal[0].Id))."
         $principal = $principal[0]
     }
 
@@ -173,7 +177,7 @@ function Resolve-RoleCrawlPrincipal {
     return [pscustomobject]$metadata
 }
 
-function Resolve-RoleCrawlSubscriptions {
+function Resolve-RoleCrawlSubscription {
     [CmdletBinding()]
     param(
         [string[]]$SubscriptionId,
@@ -282,6 +286,54 @@ function Get-RoleCrawlScopeInfo {
     return [pscustomobject]$info
 }
 
+function Get-RoleCrawlRoleDefinitionInfo {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$RoleDefinitionId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RoleDefinitionId)) {
+        return [pscustomobject]@{
+            RoleDefinitionId           = $null
+            RoleDefinitionIsCustom     = $null
+            RoleDefinitionDescription  = $null
+            RoleDefinitionAssignableScopes = @()
+            RoleDefinitionName         = $null
+        }
+    }
+
+    if ($script:RoleCrawlRoleDefinitionCache.ContainsKey($RoleDefinitionId)) {
+        return $script:RoleCrawlRoleDefinitionCache[$RoleDefinitionId]
+    }
+
+    $metadata = [pscustomobject]@{
+        RoleDefinitionId           = $RoleDefinitionId
+        RoleDefinitionIsCustom     = $null
+        RoleDefinitionDescription  = $null
+        RoleDefinitionAssignableScopes = @()
+        RoleDefinitionName         = $null
+        RoleDefinitionType         = $null
+    }
+
+    try {
+        $definition = Get-AzRoleDefinition -Id $RoleDefinitionId -ErrorAction Stop
+        $metadata = [pscustomobject]@{
+            RoleDefinitionId           = $RoleDefinitionId
+            RoleDefinitionIsCustom     = [bool]$definition.IsCustom
+            RoleDefinitionDescription  = $definition.Description
+            RoleDefinitionAssignableScopes = @($definition.AssignableScopes)
+            RoleDefinitionName         = $definition.Name
+            RoleDefinitionType         = $definition.RoleType
+        }
+    } catch {
+        Write-Verbose ("Unable to resolve metadata for role definition {0}: {1}" -f $RoleDefinitionId, $_.Exception.Message)
+    }
+
+    $script:RoleCrawlRoleDefinitionCache[$RoleDefinitionId] = $metadata
+    return $metadata
+}
+
 function Export-RoleCrawlData {
     [CmdletBinding()]
     param(
@@ -368,6 +420,7 @@ function Invoke-RoleCrawlPrincipalScan {
     )
 
     $results = New-Object System.Collections.Generic.List[pscustomobject]
+    $principalLabel = if ($PrincipalDisplayName) { $PrincipalDisplayName } elseif ($PrincipalName) { $PrincipalName } else { $PrincipalObjectId }
     $subscriptionCount = $Subscriptions.Count
 
     for ($index = 0; $index -lt $subscriptionCount; $index++) {
@@ -383,31 +436,42 @@ function Invoke-RoleCrawlPrincipalScan {
         }
 
         try {
-            $assignments = Get-AzRoleAssignment -ObjectId $PrincipalObjectId -Scope "/subscriptions/$($subscription.Id)" -IncludeClassicAdministrators:$IncludeClassicAdministrators.IsPresent -ErrorAction Stop
+            $assignments = Get-AzRoleAssignment -ObjectId $PrincipalObjectId -IncludeClassicAdministrators:$IncludeClassicAdministrators.IsPresent -All -ErrorAction Stop
         } catch {
-            Write-Warning "Failed to retrieve assignments for subscription $($subscription.Name): $($_.Exception.Message)"
+        Write-Warning "Failed to retrieve assignments for $PrincipalType $principalLabel in subscription $($subscription.Name): $($_.Exception.Message)"
             continue
         }
 
-        foreach ($assignment in $assignments) {
+        $subscriptionAssignments = $assignments | Where-Object {
+            $_.Scope -eq "/subscriptions/$($subscription.Id)" -or $_.Scope -like "/subscriptions/$($subscription.Id)/*"
+        }
+
+        foreach ($assignment in $subscriptionAssignments) {
             $scopeInfo = Get-RoleCrawlScopeInfo -Scope $assignment.Scope -SubscriptionId $subscription.Id
+            $roleMetadata = Get-RoleCrawlRoleDefinitionInfo -RoleDefinitionId $assignment.RoleDefinitionId
             $results.Add([pscustomobject]@{
-                PrincipalType        = $PrincipalType
-                PrincipalObjectId    = $PrincipalObjectId
-                PrincipalName        = $PrincipalName
-                PrincipalDisplayName = $PrincipalDisplayName
-                SubscriptionId       = $subscription.Id
-                SubscriptionName     = $subscription.Name
-                Scope                = $assignment.Scope
-                ScopeType            = $scopeInfo.ScopeType
-                ResourceGroup        = $scopeInfo.ResourceGroup
-                ResourceName         = $scopeInfo.ResourceName
-                ResourceType         = $scopeInfo.ResourceType
-                RoleDefinitionName   = $assignment.RoleDefinitionName
-                RoleDefinitionId     = $assignment.RoleDefinitionId
-                CanDelegate          = $assignment.CanDelegate
-                Condition            = $assignment.Condition
-                ConditionVersion     = $assignment.ConditionVersion
+                PrincipalType                 = $PrincipalType
+                PrincipalObjectId             = $PrincipalObjectId
+                PrincipalName                 = $PrincipalName
+                PrincipalDisplayName          = $PrincipalDisplayName
+                SubscriptionId                = $subscription.Id
+                SubscriptionName              = $subscription.Name
+                Scope                         = $assignment.Scope
+                ScopeType                     = $scopeInfo.ScopeType
+                IsSubscriptionScope           = ($assignment.Scope -eq "/subscriptions/$($subscription.Id)")
+                ResourceGroup                 = $scopeInfo.ResourceGroup
+                ResourceName                  = $scopeInfo.ResourceName
+                ResourceType                  = $scopeInfo.ResourceType
+                RoleDefinitionName            = $assignment.RoleDefinitionName
+                RoleDefinitionId              = $assignment.RoleDefinitionId
+                RoleDefinitionDescription     = $roleMetadata.RoleDefinitionDescription
+                RoleDefinitionIsCustom        = $roleMetadata.RoleDefinitionIsCustom
+                RoleDefinitionAssignableScopes = $roleMetadata.RoleDefinitionAssignableScopes
+                RoleDefinitionType            = $roleMetadata.RoleDefinitionType
+                CanDelegate                   = $assignment.CanDelegate
+                Condition                     = $assignment.Condition
+                ConditionVersion              = $assignment.ConditionVersion
+                AssignmentId                  = $assignment.Id
             }) | Out-Null
         }
     }
@@ -420,10 +484,16 @@ function Invoke-RoleCrawlPrincipalScan {
         if (-not $roleSummary) {
             $roleSummary = 'n/a'
         }
-        Write-Verbose ("Found {0} assignments across {1} subscriptions for {2}" -f $results.Count, $subscriptionSummary, ($PrincipalDisplayName ?? $PrincipalObjectId))
+        Write-Verbose ("Found {0} assignments across {1} subscriptions for {2}" -f $results.Count, $subscriptionSummary, $principalLabel)
         Write-Verbose ("Top role assignments: {0}" -f $roleSummary)
+
+        $scopeBreakdown = $results | Group-Object ScopeType | Sort-Object Count -Descending
+        if ($scopeBreakdown) {
+            $scopeSummary = ($scopeBreakdown | ForEach-Object { "{0}({1})" -f $_.Name, $_.Count }) -join ', '
+            Write-Information "Scope breakdown: $scopeSummary" -InformationAction Continue
+        }
     } else {
-        Write-Verbose ("No role assignments found for {0}" -f ($PrincipalDisplayName ?? $PrincipalObjectId))
+        Write-Verbose ("No role assignments found for {0}" -f $principalLabel)
     }
 
     if ($ExportPath) {
@@ -458,7 +528,7 @@ function Get-AzUserRoleAssignments {
         [string]$TenantId
     )
 
-    Ensure-RoleCrawlConnection -TenantId $TenantId | Out-Null
+    Initialize-RoleCrawlConnection -TenantId $TenantId | Out-Null
 
     if (-not $UserObjectId -and -not $UserPrincipalName -and -not $CurrentUser.IsPresent) {
         $CurrentUser = $true
@@ -511,7 +581,7 @@ function Get-AzUserRoleAssignments {
         }
     }
 
-    $subscriptions = Resolve-RoleCrawlSubscriptions -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -All:($AllSubscriptions.IsPresent)
+    $subscriptions = Resolve-RoleCrawlSubscription -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -All:($AllSubscriptions.IsPresent)
 
     $results = New-Object System.Collections.Generic.List[pscustomobject]
     foreach ($principal in $principals) {
@@ -538,7 +608,7 @@ function Get-AzGroupRoleAssignments {
         [string]$TenantId
     )
 
-    Ensure-RoleCrawlConnection -TenantId $TenantId | Out-Null
+    Initialize-RoleCrawlConnection -TenantId $TenantId | Out-Null
 
     $principalBuffer = New-Object System.Collections.Generic.List[pscustomobject]
     $groupIds = New-Object System.Collections.Generic.List[string]
@@ -593,7 +663,7 @@ function Get-AzGroupRoleAssignments {
         }
     }
 
-    $subscriptions = Resolve-RoleCrawlSubscriptions -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -All:($AllSubscriptions.IsPresent)
+    $subscriptions = Resolve-RoleCrawlSubscription -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -All:($AllSubscriptions.IsPresent)
 
     $results = New-Object System.Collections.Generic.List[pscustomobject]
     foreach ($principal in $principals) {
