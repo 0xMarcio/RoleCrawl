@@ -9,6 +9,7 @@ RoleCrawl is a PowerShell module for auditing Azure role assignments across subs
 - Optional CSV/JSON export per principal, with sensible defaults for batch reporting.
 - Summaries surface in verbose output to highlight top roles encountered per principal.
 - Augments each assignment with role definition metadata (custom/built-in flag, description, assignable scopes) and emits scope breakdowns for quick triage.
+- Automatically logs every Azure cmdlet executed so you can review successes, failures, and messages without enabling debug output.
 
 ## Prerequisites
 - PowerShell 5.1 or newer (PowerShell 7 recommended for cross-platform automation).
@@ -56,15 +57,21 @@ Get-AzGroupRoleAssignments -GroupDisplayName 'Incident Responders' -ExportPath .
   - Scope scans with `-SubscriptionId`, `-SubscriptionName`, or `-AllSubscriptions` (default when unspecified).
   - Use `-TenantId` to force authentication within a specific tenant.
   - Automatically captures subscription, resource-group, and resource-level assignments without additional prompts.
+  - Streams structured command and summary sections for autonomous runs (no additional switches required).
 - `Get-AzGroupRoleAssignments`
   - Accepts object IDs (`-GroupObjectId`), display names (`-GroupDisplayName`), or a newline-delimited list (`-InputFile`).
   - Shares the same subscription, export, and tenant parameters as the user cmdlet.
-  - Outputs enriched role metadata identical to the user cmdlet for consistent reporting.
+  - Outputs enriched role metadata identical to the user cmdlet and renders the same per-principal summaries.
 
-Set `-ExportPath` to a directory for multi-principal exports (files are auto-named). Supplying a `.csv` or `.json` file path is supported when scanning a single principal.
+Set `-ExportPath` to a directory for multi-principal exports (files are auto-named). Supplying a `.csv` or `.json` file path is supported when scanning a single principal. Every invocation already uses `-All` internally, so the full dataset is gathered without extra flags.
 
 ## Output
-Both cmdlets return `PSCustomObject` records with principal metadata, subscription identifiers, scope type (Subscription, ResourceGroup, Resource), resource details, role definition context (name, ID, type, description, assignable scopes), and any conditional access clauses. Verbose output surfaces top role counts, informational records confirm export locations, and the cmdlets now emit a scope breakdown (subscription vs. resource-group vs. resource assignments) to accelerate triage.
+Both cmdlets return `PSCustomObject` records with principal metadata, subscription identifiers, scope type (Subscription, ResourceGroup, Resource), resource details, role definition context (name, ID, type, description, assignable scopes), and any conditional access clauses. Console output is also organized into:
+- **Initialization** — authentication, principal lookups, and subscription discovery with success/failure state and messages.
+- **Principal summaries** — per user/group sections highlighting assignment counts, scope breakdowns, top roles, export paths, and the exact Azure cmdlets executed (with correlated outcomes).
+- **Run summary** — totals for principals processed and assignments discovered.
+
+Verbose output continues to surface additional detail, but the structured log ensures failures are visible even with default preferences.
 
 ## Use Cases
 RoleCrawl was originally built to map permissions within an Azure tenant for offensive security, but the streamlined automation flows also support blue-team investigations, least-privilege reviews, and scheduled compliance checks. Pair RoleCrawl with tools such as [GraphRunner](https://github.com/dafthack/GraphRunner) to pivot from discovered groups to concrete subscription/resource access without manual lookups.

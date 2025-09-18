@@ -4,6 +4,118 @@
 Set-StrictMode -Version Latest
 
 $script:RoleCrawlRoleDefinitionCache = @{}
+$script:RoleCrawlActiveLog = $null
+
+function Add-RoleCrawlLogEntry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Command,
+        [Parameter(Mandatory)]
+        [string]$Status,
+        [string]$Message
+    )
+
+    $log = $script:RoleCrawlActiveLog
+    if (-not $log) {
+        return
+    }
+
+    $entry = [pscustomobject]@{
+        Timestamp = Get-Date
+        Command   = $Command
+        Status    = $Status
+        Message   = $Message
+    }
+
+    $log.Add($entry) | Out-Null
+}
+
+function Get-RoleCrawlLogSlice {
+    [CmdletBinding()]
+    [OutputType([System.Object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.Generic.List[pscustomobject]]$Log,
+        [Parameter(Mandatory)]
+        [int]$StartIndex
+    )
+
+    $entries = @()
+    if ($StartIndex -ge $Log.Count) {
+        return $entries
+    }
+
+    for ($i = $StartIndex; $i -lt $Log.Count; $i++) {
+        $entries += $Log[$i]
+    }
+
+    return $entries
+}
+
+function Write-RoleCrawlLogSection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Title,
+        [Parameter(Mandatory)]
+        [System.Collections.IEnumerable]$Entries
+    )
+
+    $buffer = @($Entries)
+    if (-not $buffer.Count) {
+        return
+    }
+
+    Write-Information ""
+    Write-Information ("----- {0} -----" -f $Title)
+    foreach ($entry in $buffer) {
+        $timestamp = if ($entry.Timestamp) { $entry.Timestamp.ToString('u') } else { (Get-Date).ToString('u') }
+        $status = if ($entry.Status) { $entry.Status.ToUpperInvariant() } else { 'UNKNOWN' }
+        $line = "[{0}] {1,-7} {2}" -f $timestamp, $status, $entry.Command
+        if ($entry.Message) {
+            $line += " | $($entry.Message)"
+        }
+        Write-Information $line
+    }
+}
+
+function Write-RoleCrawlPrincipalSummary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [psobject]$Report,
+        [System.Collections.IEnumerable]$CommandLog
+    )
+
+    $summary = $Report.Summary
+    $scopeLine = if ($summary.ScopeBreakdown -and $summary.ScopeBreakdown.Count) { $summary.ScopeBreakdown -join ', ' } else { 'n/a' }
+    $rolesLine = if ($summary.TopRoles -and $summary.TopRoles.Count) { $summary.TopRoles -join ', ' } else { 'n/a' }
+
+    Write-Information ""
+    Write-Information ("===== Principal: {0} ({1}) =====" -f $Report.PrincipalLabel, $Report.PrincipalType)
+    Write-Information ("Assignments       : {0}" -f $summary.AssignmentCount)
+    Write-Information ("Subscriptions     : {0}" -f $summary.SubscriptionCount)
+    Write-Information ("Scope Breakdown   : {0}" -f $scopeLine)
+    Write-Information ("Top Roles         : {0}" -f $rolesLine)
+    if ($summary.ExportPath) {
+        Write-Information ("Exported Report   : {0}" -f $summary.ExportPath)
+    }
+
+    $buffer = @($CommandLog)
+    if ($buffer.Count) {
+        Write-Information ("Commands")
+        foreach ($entry in $buffer) {
+            $timestamp = if ($entry.Timestamp) { $entry.Timestamp.ToString('u') } else { (Get-Date).ToString('u') }
+            $status = if ($entry.Status) { $entry.Status.ToUpperInvariant() } else { 'UNKNOWN' }
+            $line = "[{0}] {1,-7} {2}" -f $timestamp, $status, $entry.Command
+            if ($entry.Message) {
+                $line += " | $($entry.Message)"
+            }
+            Write-Information $line
+        }
+    }
+}
 
 function ConvertFrom-RoleCrawlJwtPayload {
     [CmdletBinding()]
@@ -58,7 +170,15 @@ function Initialize-RoleCrawlConnection {
         [string]$TenantId
     )
 
-    $context = Get-AzContext -ErrorAction SilentlyContinue
+    try {
+        $context = Get-AzContext -ErrorAction Stop
+        $message = if ($context -and $context.Account) { "Active session for $($context.Account.Id)" } else { 'No active session detected' }
+        Add-RoleCrawlLogEntry -Command 'Get-AzContext' -Status 'Success' -Message $message
+    } catch {
+        Add-RoleCrawlLogEntry -Command 'Get-AzContext' -Status 'Failure' -Message $_.Exception.Message
+        throw "Failed to retrieve the current Azure context: $($_.Exception.Message)"
+    }
+
     $needsLogin = $false
 
     if (-not $context -or -not $context.Account) {
@@ -72,7 +192,14 @@ function Initialize-RoleCrawlConnection {
         if ($TenantId) {
             $connectParams['Tenant'] = $TenantId
         }
-        $context = Connect-AzAccount @connectParams
+        try {
+            $context = Connect-AzAccount @connectParams -ErrorAction Stop
+            $accountId = if ($context.Account) { $context.Account.Id } else { 'Unknown account' }
+            Add-RoleCrawlLogEntry -Command 'Connect-AzAccount' -Status 'Success' -Message "Authenticated as $accountId"
+        } catch {
+            Add-RoleCrawlLogEntry -Command 'Connect-AzAccount' -Status 'Failure' -Message $_.Exception.Message
+            throw "Failed to authenticate with Connect-AzAccount: $($_.Exception.Message)"
+        }
     }
 
     return $context
@@ -82,7 +209,13 @@ function Get-RoleCrawlCurrentUser {
     [CmdletBinding()]
     param()
 
-    $token = Get-AzAccessToken -ResourceUrl 'https://graph.microsoft.com/' -ErrorAction Stop
+    try {
+        $token = Get-AzAccessToken -ResourceUrl 'https://graph.microsoft.com/' -ErrorAction Stop
+        Add-RoleCrawlLogEntry -Command 'Get-AzAccessToken -ResourceUrl https://graph.microsoft.com/' -Status 'Success' -Message 'Retrieved access token'
+    } catch {
+        Add-RoleCrawlLogEntry -Command 'Get-AzAccessToken -ResourceUrl https://graph.microsoft.com/' -Status 'Failure' -Message $_.Exception.Message
+        throw "Failed to acquire an access token: $($_.Exception.Message)"
+    }
     $payload = ConvertFrom-RoleCrawlJwtPayload -Token $token.Token
 
     $objectId = $payload.oid
@@ -91,6 +224,7 @@ function Get-RoleCrawlCurrentUser {
 
     try {
         $user = Get-AzADUser -ObjectId $objectId -ErrorAction Stop
+        Add-RoleCrawlLogEntry -Command "Get-AzADUser -ObjectId $objectId" -Status 'Success' -Message 'Resolved current user metadata'
         if ($user.DisplayName) {
             $displayName = $user.DisplayName
         }
@@ -98,6 +232,7 @@ function Get-RoleCrawlCurrentUser {
             $principalName = $user.UserPrincipalName
         }
     } catch {
+        Add-RoleCrawlLogEntry -Command "Get-AzADUser -ObjectId $objectId" -Status 'Failure' -Message $_.Exception.Message
         Write-Verbose "Unable to resolve additional metadata for the current user: $($_.Exception.Message)"
     }
 
@@ -145,10 +280,19 @@ function Resolve-RoleCrawlPrincipal {
         }
     }
 
+    $commandDescription = switch ($lookupCommand) {
+        'Get-AzADUser' { if ($lookupParams.ContainsKey('ObjectId')) { "Get-AzADUser -ObjectId $($lookupParams['ObjectId'])" } else { "Get-AzADUser -UserPrincipalName $($lookupParams['UserPrincipalName'])" } }
+        'Get-AzADGroup' { if ($lookupParams.ContainsKey('ObjectId')) { "Get-AzADGroup -ObjectId $($lookupParams['ObjectId'])" } else { "Get-AzADGroup -DisplayName $($lookupParams['DisplayName'])" } }
+        default { $lookupCommand }
+    }
+
     try {
         $principal = & $lookupCommand @lookupParams -ErrorAction Stop
+        $resolvedId = if ($principal -is [System.Array]) { $principal[0].Id } else { $principal.Id }
+        Add-RoleCrawlLogEntry -Command $commandDescription -Status 'Success' -Message "Resolved $Type $resolvedId"
     } catch {
         $lookupIdentifier = if ($ObjectId) { $ObjectId } else { $PrincipalName }
+        Add-RoleCrawlLogEntry -Command $commandDescription -Status 'Failure' -Message $_.Exception.Message
         Write-Warning "Unable to resolve $Type '$lookupIdentifier': $($_.Exception.Message)"
         return $null
     }
@@ -156,6 +300,7 @@ function Resolve-RoleCrawlPrincipal {
     if ($principal -is [System.Array] -and $principal.Count -gt 1) {
         $lookupIdentifier = if ($PrincipalName) { $PrincipalName } else { $ObjectId }
         Write-Warning "$Type lookup for '$lookupIdentifier' returned multiple matches. Using the first entry ($($principal[0].Id))."
+        Add-RoleCrawlLogEntry -Command $commandDescription -Status 'Warning' -Message "Multiple matches for $lookupIdentifier; using $($principal[0].Id)"
         $principal = $principal[0]
     }
 
@@ -194,8 +339,10 @@ function Resolve-RoleCrawlSubscription {
             }
             try {
                 $subscription = Get-AzSubscription -SubscriptionId $id -ErrorAction Stop
+                Add-RoleCrawlLogEntry -Command "Get-AzSubscription -SubscriptionId $id" -Status 'Success' -Message "Resolved subscription $($subscription.Name)"
                 $subscriptions.Add($subscription) | Out-Null
             } catch {
+                Add-RoleCrawlLogEntry -Command "Get-AzSubscription -SubscriptionId $id" -Status 'Failure' -Message $_.Exception.Message
                 Write-Warning "Unable to resolve subscription '$id': $($_.Exception.Message)"
             }
         }
@@ -208,8 +355,10 @@ function Resolve-RoleCrawlSubscription {
             }
             try {
                 $subscription = Get-AzSubscription -SubscriptionName $name -ErrorAction Stop
+                Add-RoleCrawlLogEntry -Command "Get-AzSubscription -SubscriptionName $name" -Status 'Success' -Message "Resolved subscription $($subscription.Id)"
                 $subscriptions.Add($subscription) | Out-Null
             } catch {
+                Add-RoleCrawlLogEntry -Command "Get-AzSubscription -SubscriptionName $name" -Status 'Failure' -Message $_.Exception.Message
                 Write-Warning "Unable to resolve subscription '$name': $($_.Exception.Message)"
             }
         }
@@ -218,10 +367,12 @@ function Resolve-RoleCrawlSubscription {
     if (-not $subscriptions.Count -and ($All.IsPresent -or (-not $SubscriptionId -and -not $SubscriptionName))) {
         try {
             $allSubscriptions = Get-AzSubscription -ErrorAction Stop
+            Add-RoleCrawlLogEntry -Command 'Get-AzSubscription' -Status 'Success' -Message "Enumerated $($allSubscriptions.Count) subscriptions"
             foreach ($subscription in $allSubscriptions) {
                 $subscriptions.Add($subscription) | Out-Null
             }
         } catch {
+            Add-RoleCrawlLogEntry -Command 'Get-AzSubscription' -Status 'Failure' -Message $_.Exception.Message
             throw "Unable to enumerate subscriptions: $($_.Exception.Message)"
         }
     }
@@ -304,6 +455,7 @@ function Get-RoleCrawlRoleDefinitionInfo {
     }
 
     if ($script:RoleCrawlRoleDefinitionCache.ContainsKey($RoleDefinitionId)) {
+        Add-RoleCrawlLogEntry -Command "Get-AzRoleDefinition -Id $RoleDefinitionId" -Status 'Cached' -Message 'Using cached metadata'
         return $script:RoleCrawlRoleDefinitionCache[$RoleDefinitionId]
     }
 
@@ -316,8 +468,11 @@ function Get-RoleCrawlRoleDefinitionInfo {
         RoleDefinitionType         = $null
     }
 
+    $commandDescription = "Get-AzRoleDefinition -Id $RoleDefinitionId"
+
     try {
         $definition = Get-AzRoleDefinition -Id $RoleDefinitionId -ErrorAction Stop
+        Add-RoleCrawlLogEntry -Command $commandDescription -Status 'Success' -Message "Fetched role definition $($definition.Name)"
         $metadata = [pscustomobject]@{
             RoleDefinitionId           = $RoleDefinitionId
             RoleDefinitionIsCustom     = [bool]$definition.IsCustom
@@ -327,6 +482,7 @@ function Get-RoleCrawlRoleDefinitionInfo {
             RoleDefinitionType         = $definition.RoleType
         }
     } catch {
+        Add-RoleCrawlLogEntry -Command $commandDescription -Status 'Failure' -Message $_.Exception.Message
         Write-Verbose ("Unable to resolve metadata for role definition {0}: {1}" -f $RoleDefinitionId, $_.Exception.Message)
     }
 
@@ -347,6 +503,7 @@ function Export-RoleCrawlData {
 
     $dataArray = @($Data)
     if (-not $dataArray.Count) {
+        Add-RoleCrawlLogEntry -Command 'Export-RoleCrawlData' -Status 'Skipped' -Message "No data to export for $PrincipalIdentifier"
         return $null
     }
 
@@ -390,14 +547,20 @@ function Export-RoleCrawlData {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
 
-    switch ($format) {
-        'json' {
-            $json = $dataArray | ConvertTo-Json -Depth 6
-            Set-Content -Path $targetPath -Value $json -Encoding utf8
+    try {
+        switch ($format) {
+            'json' {
+                $json = $dataArray | ConvertTo-Json -Depth 6
+                Set-Content -Path $targetPath -Value $json -Encoding utf8
+            }
+            default {
+                $dataArray | Export-Csv -Path $targetPath -NoTypeInformation -Encoding UTF8
+            }
         }
-        default {
-            $dataArray | Export-Csv -Path $targetPath -NoTypeInformation -Encoding UTF8
-        }
+        Add-RoleCrawlLogEntry -Command "Export-$format $targetPath" -Status 'Success' -Message "Exported $($dataArray.Count) records for $PrincipalIdentifier"
+    } catch {
+        Add-RoleCrawlLogEntry -Command "Export-$format $targetPath" -Status 'Failure' -Message $_.Exception.Message
+        throw ("Failed to export role assignments to {0}: {1}" -f $targetPath, $_.Exception.Message)
     }
 
     return $targetPath
@@ -422,23 +585,35 @@ function Invoke-RoleCrawlPrincipalScan {
     $results = New-Object System.Collections.Generic.List[pscustomobject]
     $principalLabel = if ($PrincipalDisplayName) { $PrincipalDisplayName } elseif ($PrincipalName) { $PrincipalName } else { $PrincipalObjectId }
     $subscriptionCount = $Subscriptions.Count
+    $exportedPath = $null
 
     for ($index = 0; $index -lt $subscriptionCount; $index++) {
         $subscription = $Subscriptions[$index]
         $progress = if ($subscriptionCount) { (($index + 1) / $subscriptionCount) * 100 } else { 100 }
         Write-Progress -Activity "Scanning $PrincipalType role assignments" -Status $subscription.Name -PercentComplete $progress
 
+        $setContextCommand = "Set-AzContext -SubscriptionId $($subscription.Id)"
         try {
             Set-AzContext -SubscriptionId $subscription.Id -ErrorAction Stop | Out-Null
+            Add-RoleCrawlLogEntry -Command $setContextCommand -Status 'Success' -Message "Context set to $($subscription.Name)"
         } catch {
+            Add-RoleCrawlLogEntry -Command $setContextCommand -Status 'Failure' -Message $_.Exception.Message
             Write-Warning "Unable to set context for subscription $($subscription.Name) ($($subscription.Id)): $($_.Exception.Message)"
             continue
         }
 
+        $assignmentCommand = "Get-AzRoleAssignment -ObjectId $PrincipalObjectId -All"
+        if ($IncludeClassicAdministrators.IsPresent) {
+            $assignmentCommand += ' -IncludeClassicAdministrators'
+        }
+
         try {
             $assignments = Get-AzRoleAssignment -ObjectId $PrincipalObjectId -IncludeClassicAdministrators:$IncludeClassicAdministrators.IsPresent -All -ErrorAction Stop
+            $assignmentCount = if ($assignments) { $assignments.Count } else { 0 }
+            Add-RoleCrawlLogEntry -Command $assignmentCommand -Status 'Success' -Message "Retrieved $assignmentCount assignments"
         } catch {
-        Write-Warning "Failed to retrieve assignments for $PrincipalType $principalLabel in subscription $($subscription.Name): $($_.Exception.Message)"
+            Add-RoleCrawlLogEntry -Command $assignmentCommand -Status 'Failure' -Message $_.Exception.Message
+            Write-Warning "Failed to retrieve assignments for $PrincipalType $principalLabel in subscription $($subscription.Name): $($_.Exception.Message)"
             continue
         }
 
@@ -478,40 +653,46 @@ function Invoke-RoleCrawlPrincipalScan {
 
     Write-Progress -Activity "Scanning $PrincipalType role assignments" -Completed
 
-    if ($results.Count) {
-        $subscriptionSummary = ($results | Select-Object -ExpandProperty SubscriptionId -Unique).Count
-        $roleSummary = ($results | Group-Object RoleDefinitionName | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object { "{0}({1})" -f $_.Name, $_.Count }) -join ', '
-        if (-not $roleSummary) {
-            $roleSummary = 'n/a'
-        }
-        Write-Verbose ("Found {0} assignments across {1} subscriptions for {2}" -f $results.Count, $subscriptionSummary, $principalLabel)
-        Write-Verbose ("Top role assignments: {0}" -f $roleSummary)
+    $subscriptionSummary = if ($results.Count) { ($results | Select-Object -ExpandProperty SubscriptionId -Unique).Count } else { 0 }
+    $roleSummaryList = if ($results.Count) {
+        $results | Group-Object RoleDefinitionName | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object { "{0}({1})" -f $_.Name, $_.Count }
+    } else {
+        @()
+    }
+    $scopeBreakdownList = if ($results.Count) {
+        $results | Group-Object ScopeType | Sort-Object Count -Descending | ForEach-Object { "{0}({1})" -f $_.Name, $_.Count }
+    } else {
+        @()
+    }
 
-        $scopeBreakdown = $results | Group-Object ScopeType | Sort-Object Count -Descending
-        if ($scopeBreakdown) {
-            $scopeSummary = ($scopeBreakdown | ForEach-Object { "{0}({1})" -f $_.Name, $_.Count }) -join ', '
-            Write-Information "Scope breakdown: $scopeSummary" -InformationAction Continue
-        }
+    if ($results.Count) {
+        Write-Verbose ("Found {0} assignments across {1} subscriptions for {2}" -f $results.Count, $subscriptionSummary, $principalLabel)
     } else {
         Write-Verbose ("No role assignments found for {0}" -f $principalLabel)
     }
 
     if ($ExportPath) {
-        $identifier = $PrincipalDisplayName
-        if (-not $identifier) {
-            $identifier = $PrincipalName
-        }
-        if (-not $identifier) {
-            $identifier = $PrincipalObjectId
-        }
-
+        $identifier = if ($PrincipalDisplayName) { $PrincipalDisplayName } elseif ($PrincipalName) { $PrincipalName } else { $PrincipalObjectId }
         $exportedPath = Export-RoleCrawlData -Data $results -Path $ExportPath -PrincipalIdentifier $identifier
-        if ($exportedPath) {
-            Write-Information "Exported assignments for $identifier to $exportedPath" -InformationAction Continue
-        }
     }
 
-    return $results
+    $summary = [pscustomobject]@{
+        AssignmentCount   = $results.Count
+        SubscriptionCount = $subscriptionSummary
+        TopRoles          = @($roleSummaryList)
+        ScopeBreakdown    = @($scopeBreakdownList)
+        ExportPath        = $exportedPath
+    }
+
+    return [pscustomobject]@{
+        PrincipalType        = $PrincipalType
+        PrincipalObjectId    = $PrincipalObjectId
+        PrincipalName        = $PrincipalName
+        PrincipalDisplayName = $PrincipalDisplayName
+        PrincipalLabel       = $principalLabel
+        Assignments          = $results.ToArray()
+        Summary              = $summary
+    }
 }
 
 function Get-AzUserRoleAssignments {
@@ -528,70 +709,99 @@ function Get-AzUserRoleAssignments {
         [string]$TenantId
     )
 
-    Initialize-RoleCrawlConnection -TenantId $TenantId | Out-Null
+    $commandLog = New-Object System.Collections.Generic.List[pscustomobject]
+    $previousLog = $script:RoleCrawlActiveLog
+    $script:RoleCrawlActiveLog = $commandLog
 
-    if (-not $UserObjectId -and -not $UserPrincipalName -and -not $CurrentUser.IsPresent) {
-        $CurrentUser = $true
-    }
+    try {
+        Initialize-RoleCrawlConnection -TenantId $TenantId | Out-Null
 
-    $principalBuffer = New-Object System.Collections.Generic.List[pscustomobject]
-
-    if ($CurrentUser.IsPresent) {
-        try {
-            $current = Get-RoleCrawlCurrentUser
-            $principalBuffer.Add($current) | Out-Null
-        } catch {
-            throw "Unable to resolve the currently signed-in user. Specify -UserObjectId or -UserPrincipalName. Details: $($_.Exception.Message)"
+        if (-not $UserObjectId -and -not $UserPrincipalName -and -not $CurrentUser.IsPresent) {
+            $CurrentUser = $true
         }
-    }
 
-    if ($UserObjectId) {
-        foreach ($id in $UserObjectId) {
-            if ([string]::IsNullOrWhiteSpace($id)) { continue }
-            $principal = Resolve-RoleCrawlPrincipal -Type 'User' -ObjectId $id
-            if ($principal) {
-                $principalBuffer.Add($principal) | Out-Null
+        $principalBuffer = New-Object System.Collections.Generic.List[pscustomobject]
+
+        if ($CurrentUser.IsPresent) {
+            try {
+                $current = Get-RoleCrawlCurrentUser
+                $principalBuffer.Add($current) | Out-Null
+            } catch {
+                throw "Unable to resolve the currently signed-in user. Specify -UserObjectId or -UserPrincipalName. Details: $($_.Exception.Message)"
             }
         }
-    }
 
-    if ($UserPrincipalName) {
-        foreach ($upn in $UserPrincipalName) {
-            if ([string]::IsNullOrWhiteSpace($upn)) { continue }
-            $principal = Resolve-RoleCrawlPrincipal -Type 'User' -PrincipalName $upn
-            if ($principal) {
-                $principalBuffer.Add($principal) | Out-Null
+        if ($UserObjectId) {
+            foreach ($id in $UserObjectId) {
+                if ([string]::IsNullOrWhiteSpace($id)) { continue }
+                $principal = Resolve-RoleCrawlPrincipal -Type 'User' -ObjectId $id
+                if ($principal) {
+                    $principalBuffer.Add($principal) | Out-Null
+                }
             }
         }
-    }
 
-    if (-not $principalBuffer.Count) {
-        throw "No users resolved. Provide -UserObjectId, -UserPrincipalName, or use -CurrentUser."
-    }
-
-    $principals = $principalBuffer | Sort-Object ObjectId -Unique
-
-    if ($principals.Count -gt 1 -and $ExportPath) {
-        if (Test-Path $ExportPath -PathType Leaf) {
-            throw "When exporting multiple users, specify -ExportPath as a directory."
+        if ($UserPrincipalName) {
+            foreach ($upn in $UserPrincipalName) {
+                if ([string]::IsNullOrWhiteSpace($upn)) { continue }
+                $principal = Resolve-RoleCrawlPrincipal -Type 'User' -PrincipalName $upn
+                if ($principal) {
+                    $principalBuffer.Add($principal) | Out-Null
+                }
+            }
         }
-        $extension = [System.IO.Path]::GetExtension($ExportPath)
-        if ($extension -and -not (Test-Path $ExportPath) -and $principals.Count -gt 1) {
-            throw "When exporting multiple users, provide -ExportPath as an existing directory or one without a file extension."
+
+        if (-not $principalBuffer.Count) {
+            throw "No users resolved. Provide -UserObjectId, -UserPrincipalName, or use -CurrentUser."
         }
-    }
 
-    $subscriptions = Resolve-RoleCrawlSubscription -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -All:($AllSubscriptions.IsPresent)
+        $principals = $principalBuffer | Sort-Object ObjectId -Unique
 
-    $results = New-Object System.Collections.Generic.List[pscustomobject]
-    foreach ($principal in $principals) {
-        $principalResults = Invoke-RoleCrawlPrincipalScan -PrincipalType 'User' -PrincipalObjectId $principal.ObjectId -PrincipalName $principal.PrincipalName -PrincipalDisplayName $principal.DisplayName -Subscriptions $subscriptions -ExportPath $ExportPath -IncludeClassicAdministrators:$IncludeClassicAdministrators
-        foreach ($item in $principalResults) {
-            $results.Add($item) | Out-Null
+        if ($principals.Count -gt 1 -and $ExportPath) {
+            if (Test-Path $ExportPath -PathType Leaf) {
+                throw "When exporting multiple users, specify -ExportPath as a directory."
+            }
+            $extension = [System.IO.Path]::GetExtension($ExportPath)
+            if ($extension -and -not (Test-Path $ExportPath) -and $principals.Count -gt 1) {
+                throw "When exporting multiple users, provide -ExportPath as an existing directory or one without a file extension."
+            }
         }
-    }
 
-    return $results
+        $subscriptions = Resolve-RoleCrawlSubscription -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -All:($AllSubscriptions.IsPresent)
+
+        $logCursor = 0
+        $initializationLog = Get-RoleCrawlLogSlice -Log $commandLog -StartIndex $logCursor
+        $logCursor = $commandLog.Count
+        if ($initializationLog.Count) {
+            Write-RoleCrawlLogSection -Title 'Initialization' -Entries $initializationLog
+        }
+
+        $results = New-Object System.Collections.Generic.List[pscustomobject]
+        foreach ($principal in $principals) {
+            $report = Invoke-RoleCrawlPrincipalScan -PrincipalType 'User' -PrincipalObjectId $principal.ObjectId -PrincipalName $principal.PrincipalName -PrincipalDisplayName $principal.DisplayName -Subscriptions $subscriptions -ExportPath $ExportPath -IncludeClassicAdministrators:$IncludeClassicAdministrators
+            foreach ($item in $report.Assignments) {
+                $results.Add($item) | Out-Null
+            }
+            $principalLog = Get-RoleCrawlLogSlice -Log $commandLog -StartIndex $logCursor
+            $logCursor = $commandLog.Count
+            Write-RoleCrawlPrincipalSummary -Report $report -CommandLog $principalLog
+        }
+
+        $postLogs = Get-RoleCrawlLogSlice -Log $commandLog -StartIndex $logCursor
+        if ($postLogs.Count) {
+            Write-RoleCrawlLogSection -Title 'Post-processing' -Entries $postLogs
+        }
+
+        Write-Information ""
+        Write-Information "===== Run Summary ====="
+        Write-Information ("Principals Scanned : {0}" -f $principals.Count)
+        Write-Information ("Assignments Found  : {0}" -f $results.Count)
+
+        return $results.ToArray()
+    }
+    finally {
+        $script:RoleCrawlActiveLog = $previousLog
+    }
 }
 
 function Get-AzGroupRoleAssignments {
@@ -608,72 +818,101 @@ function Get-AzGroupRoleAssignments {
         [string]$TenantId
     )
 
-    Initialize-RoleCrawlConnection -TenantId $TenantId | Out-Null
+    $commandLog = New-Object System.Collections.Generic.List[pscustomobject]
+    $previousLog = $script:RoleCrawlActiveLog
+    $script:RoleCrawlActiveLog = $commandLog
 
-    $principalBuffer = New-Object System.Collections.Generic.List[pscustomobject]
-    $groupIds = New-Object System.Collections.Generic.List[string]
+    try {
+        Initialize-RoleCrawlConnection -TenantId $TenantId | Out-Null
 
-    if ($GroupObjectId) {
-        foreach ($id in $GroupObjectId) {
-            if ([string]::IsNullOrWhiteSpace($id)) { continue }
-            $groupIds.Add($id.Trim()) | Out-Null
+        $principalBuffer = New-Object System.Collections.Generic.List[pscustomobject]
+        $groupIds = New-Object System.Collections.Generic.List[string]
+
+        if ($GroupObjectId) {
+            foreach ($id in $GroupObjectId) {
+                if ([string]::IsNullOrWhiteSpace($id)) { continue }
+                $groupIds.Add($id.Trim()) | Out-Null
+            }
         }
-    }
 
-    if ($InputFile) {
-        if (-not (Test-Path $InputFile -PathType Leaf)) {
-            throw "Group input file '$InputFile' not found."
+        if ($InputFile) {
+            if (-not (Test-Path $InputFile -PathType Leaf)) {
+                throw "Group input file '$InputFile' not found."
+            }
+            $fileIds = Get-Content -Path $InputFile | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            foreach ($id in $fileIds) {
+                $groupIds.Add($id.Trim()) | Out-Null
+            }
         }
-        $fileIds = Get-Content -Path $InputFile | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-        foreach ($id in $fileIds) {
-            $groupIds.Add($id.Trim()) | Out-Null
-        }
-    }
 
-    foreach ($id in ($groupIds | Sort-Object -Unique)) {
-        $principal = Resolve-RoleCrawlPrincipal -Type 'Group' -ObjectId $id
-        if ($principal) {
-            $principalBuffer.Add($principal) | Out-Null
-        }
-    }
-
-    if ($GroupDisplayName) {
-        foreach ($name in $GroupDisplayName) {
-            if ([string]::IsNullOrWhiteSpace($name)) { continue }
-            $principal = Resolve-RoleCrawlPrincipal -Type 'Group' -PrincipalName $name
+        foreach ($id in ($groupIds | Sort-Object -Unique)) {
+            $principal = Resolve-RoleCrawlPrincipal -Type 'Group' -ObjectId $id
             if ($principal) {
                 $principalBuffer.Add($principal) | Out-Null
             }
         }
-    }
 
-    if (-not $principalBuffer.Count) {
-        throw "No groups resolved. Provide -GroupObjectId, -GroupDisplayName, or -InputFile."
-    }
-
-    $principals = $principalBuffer | Sort-Object ObjectId -Unique
-
-    if ($principals.Count -gt 1 -and $ExportPath) {
-        if (Test-Path $ExportPath -PathType Leaf) {
-            throw "When exporting multiple groups, specify -ExportPath as a directory."
+        if ($GroupDisplayName) {
+            foreach ($name in $GroupDisplayName) {
+                if ([string]::IsNullOrWhiteSpace($name)) { continue }
+                $principal = Resolve-RoleCrawlPrincipal -Type 'Group' -PrincipalName $name
+                if ($principal) {
+                    $principalBuffer.Add($principal) | Out-Null
+                }
+            }
         }
-        $extension = [System.IO.Path]::GetExtension($ExportPath)
-        if ($extension -and -not (Test-Path $ExportPath) -and $principals.Count -gt 1) {
-            throw "When exporting multiple groups, provide -ExportPath as an existing directory or one without a file extension."
+
+        if (-not $principalBuffer.Count) {
+            throw "No groups resolved. Provide -GroupObjectId, -GroupDisplayName, or -InputFile."
         }
-    }
 
-    $subscriptions = Resolve-RoleCrawlSubscription -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -All:($AllSubscriptions.IsPresent)
+        $principals = $principalBuffer | Sort-Object ObjectId -Unique
 
-    $results = New-Object System.Collections.Generic.List[pscustomobject]
-    foreach ($principal in $principals) {
-        $principalResults = Invoke-RoleCrawlPrincipalScan -PrincipalType 'Group' -PrincipalObjectId $principal.ObjectId -PrincipalName $principal.PrincipalName -PrincipalDisplayName $principal.DisplayName -Subscriptions $subscriptions -ExportPath $ExportPath -IncludeClassicAdministrators:$IncludeClassicAdministrators
-        foreach ($item in $principalResults) {
-            $results.Add($item) | Out-Null
+        if ($principals.Count -gt 1 -and $ExportPath) {
+            if (Test-Path $ExportPath -PathType Leaf) {
+                throw "When exporting multiple groups, specify -ExportPath as a directory."
+            }
+            $extension = [System.IO.Path]::GetExtension($ExportPath)
+            if ($extension -and -not (Test-Path $ExportPath) -and $principals.Count -gt 1) {
+                throw "When exporting multiple groups, provide -ExportPath as an existing directory or one without a file extension."
+            }
         }
-    }
 
-    return $results
+        $subscriptions = Resolve-RoleCrawlSubscription -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -All:($AllSubscriptions.IsPresent)
+
+        $logCursor = 0
+        $initializationLog = Get-RoleCrawlLogSlice -Log $commandLog -StartIndex $logCursor
+        $logCursor = $commandLog.Count
+        if ($initializationLog.Count) {
+            Write-RoleCrawlLogSection -Title 'Initialization' -Entries $initializationLog
+        }
+
+        $results = New-Object System.Collections.Generic.List[pscustomobject]
+        foreach ($principal in $principals) {
+            $report = Invoke-RoleCrawlPrincipalScan -PrincipalType 'Group' -PrincipalObjectId $principal.ObjectId -PrincipalName $principal.PrincipalName -PrincipalDisplayName $principal.DisplayName -Subscriptions $subscriptions -ExportPath $ExportPath -IncludeClassicAdministrators:$IncludeClassicAdministrators
+            foreach ($item in $report.Assignments) {
+                $results.Add($item) | Out-Null
+            }
+            $principalLog = Get-RoleCrawlLogSlice -Log $commandLog -StartIndex $logCursor
+            $logCursor = $commandLog.Count
+            Write-RoleCrawlPrincipalSummary -Report $report -CommandLog $principalLog
+        }
+
+        $postLogs = Get-RoleCrawlLogSlice -Log $commandLog -StartIndex $logCursor
+        if ($postLogs.Count) {
+            Write-RoleCrawlLogSection -Title 'Post-processing' -Entries $postLogs
+        }
+
+        Write-Information ""
+        Write-Information "===== Run Summary ====="
+        Write-Information ("Principals Scanned : {0}" -f $principals.Count)
+        Write-Information ("Assignments Found  : {0}" -f $results.Count)
+
+        return $results.ToArray()
+    }
+    finally {
+        $script:RoleCrawlActiveLog = $previousLog
+    }
 }
 
 Export-ModuleMember -Function 'Get-AzUserRoleAssignments', 'Get-AzGroupRoleAssignments'
