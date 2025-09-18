@@ -1,5 +1,5 @@
 # RoleCrawl
-<p align="center"><img src="rolecrawl.webp" alt="RoleCrawl" style="max-width: 50%;" /></p>
+<p align="center"><img src="rolecrawl.webp" alt="RoleCrawl" width="50%" /></p>
 RoleCrawl is a PowerShell module for auditing Azure role assignments across subscriptions, resource groups, and individual resources. The refreshed cmdlets are automation-friendly, emit structured objects, and can export CSV or JSON reports without requiring any interactive prompts.
 
 ## Features
