@@ -1,251 +1,609 @@
 # Author: Eli Ainhorn (sleeptok3n)
 # License: BSD 3-Clause
 
-Write-Host -ForegroundColor Green " 
-   ▄████████  ▄██████▄   ▄█          ▄████████  ▄████████    ▄████████    ▄████████  ▄█     █▄   ▄█      
-  ███    ███ ███    ███ ███         ███    ███ ███    ███   ███    ███   ███    ███ ███     ███ ███              
-  ███    ███ ███    ███ ███         ███    █▀  ███    █▀    ███    ███   ███    ███ ███     ███ ███      
- ▄███▄▄▄▄██▀ ███    ███ ███        ▄███▄▄▄     ███         ▄███▄▄▄▄██▀   ███    ███ ███     ███ ███      
-▀▀███▀▀▀▀▀   ███    ███ ███       ▀▀███▀▀▀     ███        ▀▀███▀▀▀▀▀   ▀███████████ ███     ███ ███      
-▀███████████ ███    ███ ███         ███    █▄  ███    █▄  ▀███████████   ███    ███ ███     ███ ███      
-  ███    ███ ███    ███ ███▌    ▄   ███    ███ ███    ███   ███    ███   ███    ███ ███ ▄█▄ ███ ███▌    ▄
-  ███    ███  ▀██████▀  █████▄▄██   ██████████ ████████▀    ███    ███   ███    █▀   ▀███▀███▀  █████▄▄██
-  ███    ███            ▀                                   ███    ███                          ▀               
-                              
-                               ""Navigating through the permissions maze""
-                                    by Eli Ainhorn (sleeptok3n)                                                   
-"
-if ($IsWindows -or [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
-    Write-Host "Detected Windows environment." -ForegroundColor Yellow
-} elseif ($IsMacOS) {
-    Write-Host "Detected macOS environment." -ForegroundColor Yellow
-    if (-not (Get-Module -ListAvailable -Name PSmacOS)) {
-        Write-Host "PSmacOS module not found. Installing..." -ForegroundColor Yellow
-        Install-Module PSmacOS -Scope CurrentUser -Force
-        Import-Module PSmacOS -Force
-        Write-Host "PSmacOS module installed successfully." -ForegroundColor Yellow
+Set-StrictMode -Version Latest
+
+function ConvertFrom-RoleCrawlJwtPayload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Token
+    )
+
+    $segments = $Token.Split('.')
+    if ($segments.Count -lt 2) {
+        throw "The access token is not a valid JWT"
+    }
+
+    $payload = $segments[1].Replace('-', '+').Replace('_', '/')
+    $padding = (4 - ($payload.Length % 4)) % 4
+    if ($padding) {
+        $payload += '=' * $padding
+    }
+
+    $bytes = [System.Convert]::FromBase64String($payload)
+    $jsonPayload = [System.Text.Encoding]::UTF8.GetString($bytes)
+    return $jsonPayload | ConvertFrom-Json
+}
+
+function Get-RoleCrawlSafeFileName {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Value
+    )
+
+    $invalid = [System.IO.Path]::GetInvalidFileNameChars()
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($character in $Value.ToCharArray()) {
+        if ($invalid -contains $character) {
+            [void]$builder.Append('_')
+        } else {
+            [void]$builder.Append($character)
+        }
+    }
+
+    $result = $builder.ToString().Trim('_')
+    if (-not $result) {
+        $result = 'rolecrawldata'
+    }
+    return $result
+}
+
+function Ensure-RoleCrawlConnection {
+    [CmdletBinding()]
+    param(
+        [string]$TenantId
+    )
+
+    $context = Get-AzContext -ErrorAction SilentlyContinue
+    $needsLogin = $false
+
+    if (-not $context -or -not $context.Account) {
+        $needsLogin = $true
+    } elseif ($TenantId -and $context.Tenant -and $context.Tenant.Id -ne $TenantId) {
+        $needsLogin = $true
+    }
+
+    if ($needsLogin) {
+        $connectParams = @{}
+        if ($TenantId) {
+            $connectParams['Tenant'] = $TenantId
+        }
+        $context = Connect-AzAccount @connectParams
+    }
+
+    return $context
+}
+
+function Get-RoleCrawlCurrentUser {
+    [CmdletBinding()]
+    param()
+
+    $token = Get-AzAccessToken -ResourceUrl 'https://graph.microsoft.com/' -ErrorAction Stop
+    $payload = ConvertFrom-RoleCrawlJwtPayload -Token $token.Token
+
+    $objectId = $payload.oid
+    $principalName = $payload.preferred_username
+    $displayName = $payload.name
+
+    try {
+        $user = Get-AzADUser -ObjectId $objectId -ErrorAction Stop
+        if ($user.DisplayName) {
+            $displayName = $user.DisplayName
+        }
+        if ($user.UserPrincipalName) {
+            $principalName = $user.UserPrincipalName
+        }
+    } catch {
+        Write-Verbose "Unable to resolve additional metadata for the current user: $($_.Exception.Message)"
+    }
+
+    return [pscustomobject]@{
+        ObjectId      = $objectId
+        PrincipalName = $principalName
+        DisplayName   = $displayName
+    }
+}
+
+function Resolve-RoleCrawlPrincipal {
+    [CmdletBinding(DefaultParameterSetName = 'ObjectId')]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('User', 'Group')]
+        [string]$Type,
+
+        [Parameter(ParameterSetName = 'ObjectId')]
+        [string]$ObjectId,
+
+        [Parameter(ParameterSetName = 'PrincipalName')]
+        [string]$PrincipalName
+    )
+
+    if (-not $ObjectId -and -not $PrincipalName) {
+        throw "Either ObjectId or PrincipalName must be provided"
+    }
+
+    $lookupParams = @{}
+    $lookupCommand = $null
+
+    if ($Type -eq 'User') {
+        $lookupCommand = 'Get-AzADUser'
+        if ($ObjectId) {
+            $lookupParams['ObjectId'] = $ObjectId
+        } else {
+            $lookupParams['UserPrincipalName'] = $PrincipalName
+        }
     } else {
-        Write-Host "PSmacOS module is already installed." -ForegroundColor Yellow
-        Import-Module PSmacOS
+        $lookupCommand = 'Get-AzADGroup'
+        if ($ObjectId) {
+            $lookupParams['ObjectId'] = $ObjectId
+        } else {
+            $lookupParams['DisplayName'] = $PrincipalName
+        }
     }
-} elseif ($IsLinux) {
-    Write-Host "Detected Linux environment." -ForegroundColor Yellow
-    if (-not (Get-Module -ListAvailable -Name Microsoft.PowerShell.GraphicalTools)) {
-        Write-Host "Microsoft.PowerShell.GraphicalTools module not found. Installing..." -ForegroundColor Yellow
-        Install-Module Microsoft.PowerShell.GraphicalTools -Scope CurrentUser -Force
-        Import-Module Microsoft.PowerShell.GraphicalTools -Force
-        Write-Host "Microsoft.PowerShell.GraphicalTools module installed successfully." -ForegroundColor Yellow
+
+    try {
+        $principal = & $lookupCommand @lookupParams -ErrorAction Stop
+    } catch {
+        Write-Warning "Unable to resolve $Type '$($ObjectId ?? $PrincipalName)': $($_.Exception.Message)"
+        return $null
+    }
+
+    if ($principal -is [System.Array] -and $principal.Count -gt 1) {
+        Write-Warning "$Type lookup for '$($PrincipalName ?? $ObjectId)' returned multiple matches. Using the first entry ($($principal[0].Id))."
+        $principal = $principal[0]
+    }
+
+    $metadata = [ordered]@{
+        ObjectId      = $principal.Id
+        DisplayName   = $principal.DisplayName
+        PrincipalName = $null
+    }
+
+    if ($Type -eq 'User') {
+        $metadata.PrincipalName = $principal.UserPrincipalName
     } else {
-        Write-Host "Microsoft.PowerShell.GraphicalTools module is already installed." -ForegroundColor Yellow
+        $metadata.PrincipalName = $principal.Mail
+        if (-not $metadata.PrincipalName) {
+            $metadata.PrincipalName = $principal.DisplayName
+        }
     }
-} else {
-    Write-Host "Detected an unknown environment. Some features may not work as expected." -ForegroundColor Yellow
-}
-function Show-Data {
-    param([Parameter(Mandatory=$true)] [object]$Data)
 
-    if ($IsMacOS) {
-        $Data | Out-GridView
+    return [pscustomobject]$metadata
+}
+
+function Resolve-RoleCrawlSubscriptions {
+    [CmdletBinding()]
+    param(
+        [string[]]$SubscriptionId,
+        [string[]]$SubscriptionName,
+        [switch]$All
+    )
+
+    $subscriptions = New-Object System.Collections.Generic.List[object]
+
+    if ($SubscriptionId) {
+        foreach ($id in $SubscriptionId) {
+            if ([string]::IsNullOrWhiteSpace($id)) {
+                continue
+            }
+            try {
+                $subscription = Get-AzSubscription -SubscriptionId $id -ErrorAction Stop
+                $subscriptions.Add($subscription) | Out-Null
+            } catch {
+                Write-Warning "Unable to resolve subscription '$id': $($_.Exception.Message)"
+            }
+        }
+    }
+
+    if ($SubscriptionName) {
+        foreach ($name in $SubscriptionName) {
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                continue
+            }
+            try {
+                $subscription = Get-AzSubscription -SubscriptionName $name -ErrorAction Stop
+                $subscriptions.Add($subscription) | Out-Null
+            } catch {
+                Write-Warning "Unable to resolve subscription '$name': $($_.Exception.Message)"
+            }
+        }
+    }
+
+    if (-not $subscriptions.Count -and ($All.IsPresent -or (-not $SubscriptionId -and -not $SubscriptionName))) {
+        try {
+            $allSubscriptions = Get-AzSubscription -ErrorAction Stop
+            foreach ($subscription in $allSubscriptions) {
+                $subscriptions.Add($subscription) | Out-Null
+            }
+        } catch {
+            throw "Unable to enumerate subscriptions: $($_.Exception.Message)"
+        }
+    }
+
+    $unique = $subscriptions | Sort-Object -Property Id -Unique
+    if (-not $unique) {
+        throw "No subscriptions resolved. Provide -SubscriptionId/-SubscriptionName or ensure the connected account has access."
+    }
+    return $unique
+}
+
+function Get-RoleCrawlScopeInfo {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Scope,
+        [Parameter(Mandatory)]
+        [string]$SubscriptionId
+    )
+
+    $info = [ordered]@{
+        ScopeType    = 'Subscription'
+        ResourceGroup = $null
+        ResourceName  = $null
+        ResourceType  = $null
+    }
+
+    $normalizedScope = $Scope.TrimEnd('/')
+
+    if ($normalizedScope -match "/subscriptions/$SubscriptionId/resourceGroups/([^/]+)$") {
+        $info.ScopeType = 'ResourceGroup'
+        $info.ResourceGroup = $matches[1]
+        return [pscustomobject]$info
+    }
+
+    if ($normalizedScope -match "/subscriptions/$SubscriptionId/resourceGroups/([^/]+)/providers/(.+)$") {
+        $info.ScopeType = 'Resource'
+        $info.ResourceGroup = $matches[1]
+        $providerSegment = $matches[2]
+        $segments = $providerSegment.Split('/')
+        if ($segments.Length -ge 2) {
+            $info.ResourceType = "$($segments[0])/$($segments[1])"
+            $info.ResourceName = $segments[-1]
+        }
+
+        try {
+            $resource = Get-AzResource -ResourceId $normalizedScope -ErrorAction Stop
+            if ($resource.ResourceGroupName) {
+                $info.ResourceGroup = $resource.ResourceGroupName
+            }
+            if ($resource.Name) {
+                $info.ResourceName = $resource.Name
+            }
+            if ($resource.ResourceType) {
+                $info.ResourceType = $resource.ResourceType
+            }
+        } catch {
+            Write-Verbose "Unable to resolve metadata for resource scope '$normalizedScope': $($_.Exception.Message)"
+        }
+    }
+
+    return [pscustomobject]$info
+}
+
+function Export-RoleCrawlData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IEnumerable]$Data,
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [string]$PrincipalIdentifier
+    )
+
+    $dataArray = @($Data)
+    if (-not $dataArray.Count) {
+        return $null
+    }
+
+    $targetPath = $Path
+    $format = 'csv'
+
+    if (Test-Path $targetPath) {
+        $item = Get-Item $targetPath
+        if ($item.PSIsContainer) {
+            $safeName = Get-RoleCrawlSafeFileName -Value $PrincipalIdentifier
+            $targetPath = Join-Path -Path $item.FullName -ChildPath ("{0}-role-assignments.csv" -f $safeName)
+        } else {
+            $extension = [System.IO.Path]::GetExtension($targetPath)
+            if ($extension) {
+                $format = $extension.TrimStart('.').ToLowerInvariant()
+            }
+        }
     } else {
-        # Use Out-GridView on Windows and other platforms
-        $Data | Out-GridView
+        $extension = [System.IO.Path]::GetExtension($targetPath)
+        if (-not $extension -and [System.IO.Directory]::Exists($targetPath)) {
+            $safeName = Get-RoleCrawlSafeFileName -Value $PrincipalIdentifier
+            $targetPath = Join-Path -Path $targetPath -ChildPath ("{0}-role-assignments.csv" -f $safeName)
+        } elseif (-not $extension) {
+            $targetPath = $targetPath + '.csv'
+        } else {
+            $format = $extension.TrimStart('.').ToLowerInvariant()
+        }
     }
-}
 
-function Select-Subscriptions {
-    param ([object[]]$allSubscriptions)
-    $allSubscriptions | Out-GridView -PassThru -Title "Select One or More Subscriptions"
-}
-
-
-function Connect-ToAzure {
-    $azContext = Get-AzContext -ErrorAction SilentlyContinue
-    if (-not $azContext -or -not $azContext.Account) {
-        Write-Host "No active Azure session found. Initiating login..."
-        $azContext = Connect-AzAccount
+    if ($format -notin @('csv', 'json')) {
+        Write-Warning "Unsupported export format '$format'. Defaulting to CSV."
+        $format = 'csv'
+        $targetPath = [System.IO.Path]::ChangeExtension($targetPath, '.csv')
     }
-    else {
-        Write-Host "Using existing Azure session for $($azContext.Account.Id)"
+
+    $directory = Split-Path -Parent $targetPath
+    if (-not $directory) {
+        $directory = (Get-Location).Path
     }
-    $accessToken = (Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com/").Token
-    $headers = @{
-        'Authorization' = "Bearer $accessToken"
-        'Content-Type'  = 'application/json'
+    if (-not (Test-Path $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
-    return $headers
+
+    switch ($format) {
+        'json' {
+            $json = $dataArray | ConvertTo-Json -Depth 6
+            Set-Content -Path $targetPath -Value $json -Encoding utf8
+        }
+        default {
+            $dataArray | Export-Csv -Path $targetPath -NoTypeInformation -Encoding UTF8
+        }
+    }
+
+    return $targetPath
 }
 
+function Invoke-RoleCrawlPrincipalScan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('User', 'Group')]
+        [string]$PrincipalType,
+        [Parameter(Mandatory)]
+        [string]$PrincipalObjectId,
+        [string]$PrincipalName,
+        [string]$PrincipalDisplayName,
+        [Parameter(Mandatory)]
+        [object[]]$Subscriptions,
+        [string]$ExportPath,
+        [switch]$IncludeClassicAdministrators
+    )
 
-function Get-SelectedSubscriptions {
-    $allSubscriptions = Get-AzSubscription
-    $selectedSubscriptions = Select-Subscriptions -allSubscriptions $allSubscriptions
-    return $selectedSubscriptions
-}
+    $results = New-Object System.Collections.Generic.List[pscustomobject]
+    $subscriptionCount = $Subscriptions.Count
 
-function Initialize-Scan {
-    $startTime = Get-Date
-    Write-Host "Scan started at: $startTime" -ForegroundColor Green
-    return $startTime
-}
+    for ($index = 0; $index -lt $subscriptionCount; $index++) {
+        $subscription = $Subscriptions[$index]
+        $progress = if ($subscriptionCount) { (($index + 1) / $subscriptionCount) * 100 } else { 100 }
+        Write-Progress -Activity "Scanning $PrincipalType role assignments" -Status $subscription.Name -PercentComplete $progress
 
-function Finalize-Scan {
-    param($startTime, $filePath)
-    $endTime = Get-Date
-    $totalDuration = $endTime - $startTime
-    Write-Host "Scan completed at: $endTime" -ForegroundColor Green
-    Write-Host "Total Duration: $totalDuration" -ForegroundColor Green
-    Write-Host "Operation completed. Check the $filePath file for details." -ForegroundColor Yellow
+        try {
+            Set-AzContext -SubscriptionId $subscription.Id -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Warning "Unable to set context for subscription $($subscription.Name) ($($subscription.Id)): $($_.Exception.Message)"
+            continue
+        }
+
+        try {
+            $assignments = Get-AzRoleAssignment -ObjectId $PrincipalObjectId -Scope "/subscriptions/$($subscription.Id)" -IncludeClassicAdministrators:$IncludeClassicAdministrators.IsPresent -ErrorAction Stop
+        } catch {
+            Write-Warning "Failed to retrieve assignments for subscription $($subscription.Name): $($_.Exception.Message)"
+            continue
+        }
+
+        foreach ($assignment in $assignments) {
+            $scopeInfo = Get-RoleCrawlScopeInfo -Scope $assignment.Scope -SubscriptionId $subscription.Id
+            $results.Add([pscustomobject]@{
+                PrincipalType        = $PrincipalType
+                PrincipalObjectId    = $PrincipalObjectId
+                PrincipalName        = $PrincipalName
+                PrincipalDisplayName = $PrincipalDisplayName
+                SubscriptionId       = $subscription.Id
+                SubscriptionName     = $subscription.Name
+                Scope                = $assignment.Scope
+                ScopeType            = $scopeInfo.ScopeType
+                ResourceGroup        = $scopeInfo.ResourceGroup
+                ResourceName         = $scopeInfo.ResourceName
+                ResourceType         = $scopeInfo.ResourceType
+                RoleDefinitionName   = $assignment.RoleDefinitionName
+                RoleDefinitionId     = $assignment.RoleDefinitionId
+                CanDelegate          = $assignment.CanDelegate
+                Condition            = $assignment.Condition
+                ConditionVersion     = $assignment.ConditionVersion
+            }) | Out-Null
+        }
+    }
+
+    Write-Progress -Activity "Scanning $PrincipalType role assignments" -Completed
+
+    if ($results.Count) {
+        $subscriptionSummary = ($results | Select-Object -ExpandProperty SubscriptionId -Unique).Count
+        $roleSummary = ($results | Group-Object RoleDefinitionName | Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object { "{0}({1})" -f $_.Name, $_.Count }) -join ', '
+        if (-not $roleSummary) {
+            $roleSummary = 'n/a'
+        }
+        Write-Verbose ("Found {0} assignments across {1} subscriptions for {2}" -f $results.Count, $subscriptionSummary, ($PrincipalDisplayName ?? $PrincipalObjectId))
+        Write-Verbose ("Top role assignments: {0}" -f $roleSummary)
+    } else {
+        Write-Verbose ("No role assignments found for {0}" -f ($PrincipalDisplayName ?? $PrincipalObjectId))
+    }
+
+    if ($ExportPath) {
+        $identifier = $PrincipalDisplayName
+        if (-not $identifier) {
+            $identifier = $PrincipalName
+        }
+        if (-not $identifier) {
+            $identifier = $PrincipalObjectId
+        }
+
+        $exportedPath = Export-RoleCrawlData -Data $results -Path $ExportPath -PrincipalIdentifier $identifier
+        if ($exportedPath) {
+            Write-Information "Exported assignments for $identifier to $exportedPath" -InformationAction Continue
+        }
+    }
+
+    return $results
 }
 
 function Get-AzUserRoleAssignments {
-    $startTime = Initialize-Scan
-    $headers = Connect-ToAzure
-    $selectedSubscriptions = Get-SelectedSubscriptions
-    if (-not $selectedSubscriptions) { return }
+    [CmdletBinding()]
+    param(
+        [string[]]$UserObjectId,
+        [string[]]$UserPrincipalName,
+        [switch]$CurrentUser,
+        [string[]]$SubscriptionId,
+        [string[]]$SubscriptionName,
+        [switch]$AllSubscriptions,
+        [string]$ExportPath,
+        [switch]$IncludeClassicAdministrators,
+        [string]$TenantId
+    )
 
- try {
-        $token = ((Get-AzAccessToken).Token).Split(".")[1].Replace('-', '+').Replace('_', '/')
-        while ($token.Length % 4) { $token += "=" }  # Ensure proper Base64 padding
-        $userObjectId = ([System.Text.Encoding]::ASCII.GetString([System.Convert]::FromBase64String($token)) | ConvertFrom-Json).oid
-    } catch {
-        Write-Host "Failed to extract user object ID from the token." -ForegroundColor Red
-        return
+    Ensure-RoleCrawlConnection -TenantId $TenantId | Out-Null
+
+    if (-not $UserObjectId -and -not $UserPrincipalName -and -not $CurrentUser.IsPresent) {
+        $CurrentUser = $true
     }
 
-    if (-not $userObjectId) {
-        Write-Host "User Object ID is required to proceed." -ForegroundColor Red
-        return
-    }
+    $principalBuffer = New-Object System.Collections.Generic.List[pscustomobject]
 
-    $results = @()
-    foreach ($subscription in $selectedSubscriptions) {
-        Set-AzContext -SubscriptionId $subscription.Id
-        $subscriptionScope = "/subscriptions/$($subscription.Id)"
-
-        # Check role assignments at the subscription level
+    if ($CurrentUser.IsPresent) {
         try {
-            $subscriptionRoleAssignments = Get-AzRoleAssignment -ObjectId $userObjectId -Scope $subscriptionScope -ErrorAction Stop
-            foreach ($roleAssignment in $subscriptionRoleAssignments) {
-                if ($roleAssignment.Scope -eq $subscriptionScope) {
-                    $outputMessage = "Found role assignment for user: $userObjectId - Subscription: $($subscription.Name), Role: $($roleAssignment.RoleDefinitionName), Scope: $($subscription.Id)"
-                    Write-Host $outputMessage -ForegroundColor Green
-
-                    $results += New-Object PSObject -Property @{
-                        SubscriptionName = $subscription.Name
-                        Scope = $roleAssignment.Scope
-                        ResourceName = $resource.Name
-                        ResourceType = $resource.ResourceType
-                        UserID = $userObjectId
-                        RoleDefinitionName = $roleAssignment.RoleDefinitionName
-                    }
-                }
-            }
+            $current = Get-RoleCrawlCurrentUser
+            $principalBuffer.Add($current) | Out-Null
         } catch {
-            Write-Host "Error checking subscription-level roles: $($_.Exception.Message)" -ForegroundColor Red
-        }
-
-        # Check role assignments at the resource level
-        $resources = Get-AzResource
-        foreach ($resource in $resources) {
-            try {
-                $roleAssignments = Get-AzRoleAssignment -ObjectId $userObjectId -Scope $resource.Id -ErrorAction SilentlyContinue
-                foreach ($roleAssignment in $roleAssignments) {
-                    $outputMessage = "Found role assignment for user: $userObjectId - Subscription: $($subscription.Name), Resource: $($resource.Name), Role: $($roleAssignment.RoleDefinitionName), Scope: $($roleAssignment.Scope), Resource Type: $($resource.ResourceType)"
-                    Write-Host $outputMessage -ForegroundColor Green
-
-                    $results += New-Object PSObject -Property @{
-                        SubscriptionName = $subscription.Name
-                        Scope = $roleAssignment.Scope
-                        ResourceName = $resource.Name
-                        ResourceType = $resource.ResourceType
-                        UserID = $userObjectId
-                        RoleDefinitionName = $roleAssignment.RoleDefinitionName
-                    }
-                }
-            } catch {
-                Write-Host "Error with resource: $($resource.Id) - $($_.Exception.Message)" -ForegroundColor Red
-            }
-
-            $progress = [math]::Round(($resources.IndexOf($resource) / $resources.Count) * 100, 2)
-            Write-Progress -Activity "Checking Roles" -Status "$progress% Complete:" -PercentComplete $progress
+            throw "Unable to resolve the currently signed-in user. Specify -UserObjectId or -UserPrincipalName. Details: $($_.Exception.Message)"
         }
     }
 
-    $results | Export-Csv -Path "UserRoleAssignments.csv" -NoTypeInformation
-    Finalize-Scan -startTime $startTime -filePath "UserRoleAssignments.csv"
+    if ($UserObjectId) {
+        foreach ($id in $UserObjectId) {
+            if ([string]::IsNullOrWhiteSpace($id)) { continue }
+            $principal = Resolve-RoleCrawlPrincipal -Type 'User' -ObjectId $id
+            if ($principal) {
+                $principalBuffer.Add($principal) | Out-Null
+            }
+        }
+    }
+
+    if ($UserPrincipalName) {
+        foreach ($upn in $UserPrincipalName) {
+            if ([string]::IsNullOrWhiteSpace($upn)) { continue }
+            $principal = Resolve-RoleCrawlPrincipal -Type 'User' -PrincipalName $upn
+            if ($principal) {
+                $principalBuffer.Add($principal) | Out-Null
+            }
+        }
+    }
+
+    if (-not $principalBuffer.Count) {
+        throw "No users resolved. Provide -UserObjectId, -UserPrincipalName, or use -CurrentUser."
+    }
+
+    $principals = $principalBuffer | Sort-Object ObjectId -Unique
+
+    if ($principals.Count -gt 1 -and $ExportPath) {
+        if (Test-Path $ExportPath -PathType Leaf) {
+            throw "When exporting multiple users, specify -ExportPath as a directory."
+        }
+        $extension = [System.IO.Path]::GetExtension($ExportPath)
+        if ($extension -and -not (Test-Path $ExportPath) -and $principals.Count -gt 1) {
+            throw "When exporting multiple users, provide -ExportPath as an existing directory or one without a file extension."
+        }
+    }
+
+    $subscriptions = Resolve-RoleCrawlSubscriptions -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -All:($AllSubscriptions.IsPresent)
+
+    $results = New-Object System.Collections.Generic.List[pscustomobject]
+    foreach ($principal in $principals) {
+        $principalResults = Invoke-RoleCrawlPrincipalScan -PrincipalType 'User' -PrincipalObjectId $principal.ObjectId -PrincipalName $principal.PrincipalName -PrincipalDisplayName $principal.DisplayName -Subscriptions $subscriptions -ExportPath $ExportPath -IncludeClassicAdministrators:$IncludeClassicAdministrators
+        foreach ($item in $principalResults) {
+            $results.Add($item) | Out-Null
+        }
+    }
+
+    return $results
 }
 
 function Get-AzGroupRoleAssignments {
-    $startTime = Initialize-Scan
-    $headers = Connect-ToAzure
-    $selectedSubscriptions = Get-SelectedSubscriptions
-    if (-not $selectedSubscriptions) { return }
+    [CmdletBinding()]
+    param(
+        [string[]]$GroupObjectId,
+        [string[]]$GroupDisplayName,
+        [string]$InputFile,
+        [string[]]$SubscriptionId,
+        [string[]]$SubscriptionName,
+        [switch]$AllSubscriptions,
+        [string]$ExportPath,
+        [switch]$IncludeClassicAdministrators,
+        [string]$TenantId
+    )
 
-    $inputOption = Read-Host "Enter 'id' to input a single group ID or 'file' to input a file path with group IDs"
-    $groupIds = @()
-    if ($inputOption -eq "file") {
-        $filePath = Read-Host "Enter the full path to the text file containing group IDs"
-        $groupIds = Get-Content $filePath
-    } else {
-        $singleGroupId = Read-Host "Enter the Azure AD Group Object ID"
-        $groupIds += $singleGroupId
+    Ensure-RoleCrawlConnection -TenantId $TenantId | Out-Null
+
+    $principalBuffer = New-Object System.Collections.Generic.List[pscustomobject]
+    $groupIds = New-Object System.Collections.Generic.List[string]
+
+    if ($GroupObjectId) {
+        foreach ($id in $GroupObjectId) {
+            if ([string]::IsNullOrWhiteSpace($id)) { continue }
+            $groupIds.Add($id.Trim()) | Out-Null
+        }
     }
 
-    $results = @()
-    foreach ($groupId in $groupIds) {
-        foreach ($subscription in $selectedSubscriptions) {
-            Set-AzContext -SubscriptionId $subscription.Id
-            $subscriptionScope = "/subscriptions/$($subscription.Id)"
+    if ($InputFile) {
+        if (-not (Test-Path $InputFile -PathType Leaf)) {
+            throw "Group input file '$InputFile' not found."
+        }
+        $fileIds = Get-Content -Path $InputFile | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        foreach ($id in $fileIds) {
+            $groupIds.Add($id.Trim()) | Out-Null
+        }
+    }
 
-            # Check role assignments at the subscription level
-            try {
-                $subscriptionRoleAssignments = Get-AzRoleAssignment -ObjectId $groupId -Scope $subscriptionScope -ErrorAction Stop
-                foreach ($roleAssignment in $subscriptionRoleAssignments) {
-                    $outputMessage = "Found role assignment for group: $groupId - Subscription: $($subscription.Name), Role: $($roleAssignment.RoleDefinitionName), Scope: $($subscription.Id)"
-                    Write-Host $outputMessage -ForegroundColor Green
+    foreach ($id in ($groupIds | Sort-Object -Unique)) {
+        $principal = Resolve-RoleCrawlPrincipal -Type 'Group' -ObjectId $id
+        if ($principal) {
+            $principalBuffer.Add($principal) | Out-Null
+        }
+    }
 
-                    $results += New-Object PSObject -Property @{
-                        SubscriptionName = $subscription.Name
-                        Scope = $roleAssignment.Scope
-                        ResourceName = $resource.Name
-                        ResourceType = $resource.ResourceType
-                        GroupID = $groupId
-                        RoleDefinitionName = $roleAssignment.RoleDefinitionName
-                    }
-                }
-            } catch {
-                Write-Host "Error checking subscription-level roles: $($_.Exception.Message)" -ForegroundColor Red
-            }
-            # Check role assignments at the resource level
-            $resources = Get-AzResource
-            foreach ($resource in $resources) {
-                try {
-                    $roleAssignments = Get-AzRoleAssignment -ObjectId $groupId -Scope $resource.Id -ErrorAction Stop
-                    foreach ($roleAssignment in $roleAssignments) {
-                        $outputMessage = "Found role assignment for group: $groupId - Subscription: $($subscription.Name), Resource: $($resource.Name), Role: $($roleAssignment.RoleDefinitionName), Scope: $($roleAssignment.Scope), Resource Type: $($resource.ResourceType)"
-                        Write-Host $outputMessage -ForegroundColor Green
-
-                        $results += New-Object PSObject -Property @{
-                            SubscriptionName = $subscription.Name
-                            Scope = $roleAssignment.Scope
-                            ResourceName = $resource.Name
-                            ResourceType = $resource.ResourceType
-                            GroupID = $groupId
-                            RoleDefinitionName = $roleAssignment.RoleDefinitionName
-                        }
-                    }
-                } catch {
-                    Write-Host "Error with resource: $($resource.Id) - $($_.Exception.Message)" -ForegroundColor Red
-                }
-
-                $progress = [math]::Round(($resources.IndexOf($resource) / $resources.Count) * 100, 2)
-                Write-Progress -Activity "Checking Roles" -Status "$progress% Complete:" -PercentComplete $progress
+    if ($GroupDisplayName) {
+        foreach ($name in $GroupDisplayName) {
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            $principal = Resolve-RoleCrawlPrincipal -Type 'Group' -PrincipalName $name
+            if ($principal) {
+                $principalBuffer.Add($principal) | Out-Null
             }
         }
     }
 
-    $results | Export-Csv -Path "GroupRoleAssignments.csv" -NoTypeInformation
-    Finalize-Scan -startTime $startTime -filePath "GroupRoleAssignments.csv"
+    if (-not $principalBuffer.Count) {
+        throw "No groups resolved. Provide -GroupObjectId, -GroupDisplayName, or -InputFile."
+    }
+
+    $principals = $principalBuffer | Sort-Object ObjectId -Unique
+
+    if ($principals.Count -gt 1 -and $ExportPath) {
+        if (Test-Path $ExportPath -PathType Leaf) {
+            throw "When exporting multiple groups, specify -ExportPath as a directory."
+        }
+        $extension = [System.IO.Path]::GetExtension($ExportPath)
+        if ($extension -and -not (Test-Path $ExportPath) -and $principals.Count -gt 1) {
+            throw "When exporting multiple groups, provide -ExportPath as an existing directory or one without a file extension."
+        }
+    }
+
+    $subscriptions = Resolve-RoleCrawlSubscriptions -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName -All:($AllSubscriptions.IsPresent)
+
+    $results = New-Object System.Collections.Generic.List[pscustomobject]
+    foreach ($principal in $principals) {
+        $principalResults = Invoke-RoleCrawlPrincipalScan -PrincipalType 'Group' -PrincipalObjectId $principal.ObjectId -PrincipalName $principal.PrincipalName -PrincipalDisplayName $principal.DisplayName -Subscriptions $subscriptions -ExportPath $ExportPath -IncludeClassicAdministrators:$IncludeClassicAdministrators
+        foreach ($item in $principalResults) {
+            $results.Add($item) | Out-Null
+        }
+    }
+
+    return $results
 }
 
 Export-ModuleMember -Function 'Get-AzUserRoleAssignments', 'Get-AzGroupRoleAssignments'
